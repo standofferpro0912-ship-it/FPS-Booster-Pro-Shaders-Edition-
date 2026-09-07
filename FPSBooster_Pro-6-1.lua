@@ -35,7 +35,13 @@ local TweenService       = game:GetService("TweenService")
 local UserInputService   = game:GetService("UserInputService")
 local GuiService         = game:GetService("GuiService")
 local Stats              = game:GetService("Stats")
-local RenderSettings     = settings().Rendering
+-- NOTE: settings() is Plugin-capability-gated -- calling it from a normal
+-- LocalScript (not a plugin) throws immediately, which used to happen
+-- right here at module load time and killed the ENTIRE script before any
+-- UI was created. RenderSettings is now resolved lazily, inside the same
+-- pcall that already wraps every write to it (see Features.SetQualityLevel
+-- below), so a normal client never even attempts the settings() call.
+local RenderSettings = nil
 
 local player    = Players.LocalPlayer
 local PlayerGui = player:WaitForChild("PlayerGui")
@@ -72,14 +78,40 @@ local Config = {
 -- to put the game back the way it actually was -- not just back to
 -- OUR idea of a default.
 ----------------------------------------------------------------
+-- Lighting.Technology is read-gated for a normal LocalScript (throws
+-- "lacking capability RobloxScript" the same way settings() throws
+-- "lacking capability Plugin") -- reading it directly here at module
+-- load time used to kill the whole script before any UI existed, the
+-- same failure mode as the earlier settings() bug. Read it through a
+-- safe helper instead; every write to Technology elsewhere in this file
+-- was already wrapped in pcall, this just makes the READS consistent
+-- with that.
+--
+-- StreamingMinRadius / StreamingTargetRadius are a different problem:
+-- Roblox docs mark them non-scriptable ("must be set on the Workspace
+-- object in Studio") -- a plain property read/write from ANY LocalScript
+-- throws "is not a valid member of Workspace", not a capability error.
+-- Every WRITE to them elsewhere in this file was already wrapped in
+-- pcall (see SetStreamingRadius / RestoreOriginal below); this read at
+-- load time was the one place that wasn't.
+local function SafeGetTechnology()
+    local ok, tech = pcall(function() return Lighting.Technology end)
+    return ok and tech or nil
+end
+
+local function SafeGetWorkspaceProperty(propName)
+    local ok, value = pcall(function() return Workspace[propName] end)
+    return ok and value or nil
+end
+
 local OriginalWorld = {
     GlobalShadows         = Lighting.GlobalShadows,
-    Technology            = Lighting.Technology,
+    Technology            = SafeGetTechnology(),
     FogEnd                = Lighting.FogEnd,
     FogStart              = Lighting.FogStart,
     StreamingEnabled      = Workspace.StreamingEnabled,
-    StreamingMinRadius    = Workspace.StreamingMinRadius,
-    StreamingTargetRadius = Workspace.StreamingTargetRadius,
+    StreamingMinRadius    = SafeGetWorkspaceProperty("StreamingMinRadius"),
+    StreamingTargetRadius = SafeGetWorkspaceProperty("StreamingTargetRadius"),
 }
 
 -- Per-object original values, captured lazily the FIRST time we ever
@@ -738,12 +770,14 @@ local QualityLevels = {
 }
 
 function Features.SetQualityLevel(level)
-    -- NOTE: RenderSettings (settings().Rendering) is PluginSecurity-protected,
-    -- so the write below is best-effort and does nothing in a real published
-    -- game (that's why the pcall never surfaces an error -- it just fails
-    -- silently every time). It may appear to work in Studio's Play button
-    -- because Studio sometimes runs local scripts with elevated context;
-    -- that does not carry over to your live game.
+    -- NOTE: RenderSettings (settings().Rendering) is Plugin-capability-gated.
+    -- In a real published game (and in most Studio contexts) a normal
+    -- LocalScript can't even call settings() without erroring, so this
+    -- resolves it lazily on first use, inside this pcall, instead of at
+    -- module load time -- a failed settings() call here just means the
+    -- Quality Level slider silently skips the (usually no-op anyway)
+    -- engine QualityLevel write and falls through to the settings below
+    -- that a LocalScript genuinely can control.
     --
     -- To make the "Quality Level" slider actually DO something client-side,
     -- it now also drives every setting a LocalScript CAN control: shadows,
@@ -754,6 +788,9 @@ function Features.SetQualityLevel(level)
     Config.QualityLevel = level
 
     pcall(function()
+        if RenderSettings == nil then
+            RenderSettings = settings().Rendering
+        end
         RenderSettings.QualityLevel = QualityLevels[level]
     end)
 
@@ -1018,7 +1055,7 @@ function Features.RunSmartBenchmark()
         SmokeFire     = Config.SmokeFire,
         Decals        = Config.Decals,
         GlobalShadows = Config.GlobalShadows,
-        Technology    = Lighting.Technology,
+        Technology    = SafeGetTechnology(),
         QualityLevel  = Config.QualityLevel,
     }
 
